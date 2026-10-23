@@ -1,29 +1,43 @@
 //!Implementation of [`TaskManager`]
 use super::TaskControlBlock;
 use crate::sync::UPSafeCell;
-use alloc::collections::VecDeque;
+use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use lazy_static::*;
-///A array of `TaskControlBlock` that is thread-safe
+///A ready queue of `TaskControlBlock` that is thread-safe
+///
+/// The key is `(stride, pid)`: `stride` orders the processes, and `pid`
+/// keeps the key unique when two processes happen to have the same stride.
 pub struct TaskManager {
-    ready_queue: VecDeque<Arc<TaskControlBlock>>,
+    ready_queue: BTreeMap<(usize, usize), Arc<TaskControlBlock>>,
 }
 
-/// A simple FIFO scheduler.
+/// A stride scheduler.
+///
+/// The process with the smallest stride is always selected, and its stride is
+/// advanced by `BIG_STRIDE / priority` right after it is scheduled. In this
+/// way the cpu time a process obtains is proportional to its priority.
 impl TaskManager {
     ///Creat an empty TaskManager
     pub fn new() -> Self {
         Self {
-            ready_queue: VecDeque::new(),
+            ready_queue: BTreeMap::new(),
         }
     }
     /// Add process back to ready queue
     pub fn add(&mut self, task: Arc<TaskControlBlock>) {
-        self.ready_queue.push_back(task);
+        let stride = task.inner_exclusive_access().stride;
+        self.ready_queue.insert((stride, task.pid.0), task);
     }
-    /// Take a process out of the ready queue
+    /// Take the process with the smallest stride out of the ready queue
     pub fn fetch(&mut self) -> Option<Arc<TaskControlBlock>> {
-        self.ready_queue.pop_front()
+        let (_, task) = self.ready_queue.pop_first()?;
+        {
+            let mut inner = task.inner_exclusive_access();
+            let pass = inner.pass();
+            inner.stride += pass;
+        }
+        Some(task)
     }
 }
 

@@ -2,13 +2,22 @@
 use alloc::sync::Arc;
 
 use crate::{
+    config::PAGE_SIZE,
     loader::get_app_data_by_name,
-    mm::{translated_refmut, translated_str},
+    mm::{translated_byte_buffer, translated_refmut, translated_str, MapPermission, VirtAddr},
     task::{
         add_task, current_task, current_user_token, exit_current_and_run_next,
         suspend_current_and_run_next,
     },
+    timer::get_time_us,
 };
+
+/// the `prot` bit meaning of `sys_mmap`: the area is readable
+const MMAP_PROT_READ: usize = 1 << 0;
+/// the `prot` bit meaning of `sys_mmap`: the area is writable
+const MMAP_PROT_WRITE: usize = 1 << 1;
+/// the `prot` bit meaning of `sys_mmap`: the area is executable
+const MMAP_PROT_EXEC: usize = 1 << 2;
 
 #[repr(C)]
 #[derive(Debug)]
@@ -102,33 +111,80 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
     // ---- release current PCB automatically
 }
 
-/// YOUR JOB: get time with second and microsecond
-/// HINT: You might reimplement it with virtual memory management.
-/// HINT: What if [`TimeVal`] is splitted by two pages ?
-pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_get_time NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+/// get time with second and microsecond
+///
+/// The `TimeVal` is written through the page table of the current process,
+/// byte by byte, so it works even if the struct is split by two pages.
+pub fn sys_get_time(ts: *mut TimeVal, _tz: usize) -> isize {
+    trace!("kernel:pid[{}] sys_get_time", current_task().unwrap().pid.0);
+    let us = get_time_us();
+    let time_val = TimeVal {
+        sec: us / 1_000_000,
+        usec: us % 1_000_000,
+    };
+    let len = core::mem::size_of::<TimeVal>();
+    let src = unsafe { core::slice::from_raw_parts(&time_val as *const TimeVal as *const u8, len) };
+    let mut buffers = translated_byte_buffer(current_user_token(), ts as *const u8, len);
+    let mut copied = 0;
+    for buffer in buffers.iter_mut() {
+        let n = core::cmp::min(buffer.len(), len - copied);
+        buffer[..n].copy_from_slice(&src[copied..copied + n]);
+        copied += n;
+    }
+    if copied == len {
+        0
+    } else {
+        -1
+    }
 }
 
-/// YOUR JOB: Implement mmap.
-pub fn sys_mmap(_start: usize, _len: usize, _port: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_mmap NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+/// Implement mmap.
+///
+/// `start` must be page aligned, `len` need not be, and `prot` is a bitmap of
+/// read/write/execute. Return 0 on success, -1 otherwise.
+pub fn sys_mmap(start: usize, len: usize, port: usize) -> isize {
+    trace!("kernel:pid[{}] sys_mmap", current_task().unwrap().pid.0);
+    let start_va: VirtAddr = start.into();
+    if len == 0 || !start_va.aligned() || port == 0 || port & !0x7 != 0 {
+        return -1;
+    }
+    if start.checked_add(len).is_none() {
+        return -1;
+    }
+    let mut permission = MapPermission::U;
+    if port & MMAP_PROT_READ != 0 {
+        permission |= MapPermission::R;
+    }
+    if port & MMAP_PROT_WRITE != 0 {
+        permission |= MapPermission::W;
+    }
+    if port & MMAP_PROT_EXEC != 0 {
+        permission |= MapPermission::X;
+    }
+    let task = current_task().unwrap();
+    if task.mmap(start, len, permission) {
+        0
+    } else {
+        -1
+    }
 }
 
-/// YOUR JOB: Implement munmap.
-pub fn sys_munmap(_start: usize, _len: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_munmap NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+/// Implement munmap.
+///
+/// The area `[start, start + len)` must exactly match an area which has been
+/// created by `sys_mmap`, so both `start` and `len` must be page aligned.
+pub fn sys_munmap(start: usize, len: usize) -> isize {
+    trace!("kernel:pid[{}] sys_munmap", current_task().unwrap().pid.0);
+    let start_va: VirtAddr = start.into();
+    if len == 0 || !start_va.aligned() || len % PAGE_SIZE != 0 {
+        return -1;
+    }
+    let task = current_task().unwrap();
+    if task.munmap(start, len) {
+        0
+    } else {
+        -1
+    }
 }
 
 /// change data segment size
@@ -141,21 +197,38 @@ pub fn sys_sbrk(size: i32) -> isize {
     }
 }
 
-/// YOUR JOB: Implement spawn.
-/// HINT: fork + exec =/= spawn
-pub fn sys_spawn(_path: *const u8) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_spawn NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+/// Implement spawn.
+///
+/// The new process runs `path` from scratch: the address space of the parent
+/// is not copied, which is what makes `spawn` much cheaper than `fork`+`exec`.
+pub fn sys_spawn(path: *const u8) -> isize {
+    trace!("kernel:pid[{}] sys_spawn", current_task().unwrap().pid.0);
+    let token = current_user_token();
+    let path = translated_str(token, path);
+    if let Some(data) = get_app_data_by_name(path.as_str()) {
+        let task = current_task().unwrap();
+        let new_task = task.spawn(data);
+        let new_pid = new_task.pid.0;
+        add_task(new_task);
+        new_pid as isize
+    } else {
+        -1
+    }
 }
 
-// YOUR JOB: Set task priority.
-pub fn sys_set_priority(_prio: isize) -> isize {
+/// Set task priority. The priority must not be smaller than 2.
+///
+/// Return the new priority on success, -1 otherwise.
+pub fn sys_set_priority(prio: isize) -> isize {
     trace!(
-        "kernel:pid[{}] sys_set_priority NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
+        "kernel:pid[{}] sys_set_priority [{}]",
+        current_task().unwrap().pid.0,
+        prio
     );
-    -1
+    if prio < 2 {
+        return -1;
+    }
+    let task = current_task().unwrap();
+    task.set_priority(prio as usize);
+    prio
 }
