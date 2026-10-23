@@ -318,6 +318,52 @@ impl MemorySet {
             false
         }
     }
+
+    /// lazy-relay: insert a new framed area for `mmap`, rejecting any
+    /// overlap with the areas which have already been mapped.
+    pub fn insert_mmap_area(
+        &mut self,
+        start_va: VirtAddr,
+        end_va: VirtAddr,
+        permission: MapPermission,
+    ) -> bool {
+        let start_vpn: VirtPageNum = start_va.floor();
+        let end_vpn: VirtPageNum = end_va.ceil();
+        if start_vpn.0 >= end_vpn.0 {
+            return false;
+        }
+        for area in self.areas.iter() {
+            let area_start = area.vpn_range.get_start().0;
+            let area_end = area.vpn_range.get_end().0;
+            // empty areas are only placeholders left by `sbrk`, skip them
+            if area_start >= area_end {
+                continue;
+            }
+            if start_vpn.0 < area_end && area_start < end_vpn.0 {
+                return false;
+            }
+        }
+        self.push(
+            MapArea::new(start_va, end_va, MapType::Framed, permission),
+            None,
+        );
+        true
+    }
+
+    /// remove the area which exactly matches `[start_va, end_va)`
+    pub fn remove_mmap_area(&mut self, start_va: VirtAddr, end_va: VirtAddr) -> bool {
+        let start_vpn: VirtPageNum = start_va.floor();
+        let end_vpn: VirtPageNum = end_va.ceil();
+        if let Some((idx, area)) = self.areas.iter_mut().enumerate().find(|(_, area)| {
+            area.vpn_range.get_start().0 == start_vpn.0 && area.vpn_range.get_end().0 == end_vpn.0
+        }) {
+            area.unmap(&mut self.page_table);
+            self.areas.remove(idx);
+            true
+        } else {
+            false
+        }
+    }
 }
 /// map area structure, controls a contiguous piece of virtual memory
 pub struct MapArea {
