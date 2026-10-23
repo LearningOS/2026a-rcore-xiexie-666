@@ -15,6 +15,7 @@ mod switch;
 mod task;
 
 use crate::loader::{get_app_data, get_num_app};
+use crate::mm::MapPermission;
 use crate::sync::UPSafeCell;
 use crate::trap::TrapContext;
 use alloc::vec::Vec;
@@ -133,6 +134,36 @@ impl TaskManager {
         inner.tasks[cur].change_program_brk(size)
     }
 
+    /// Record one more call of the syscall numbered `syscall_id` by the
+    /// current 'Running' task
+    fn incr_current_syscall_count(&self, syscall_id: usize) {
+        let mut inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        inner.tasks[cur].incr_syscall_count(syscall_id);
+    }
+
+    /// How many times the current 'Running' task has called the syscall
+    /// numbered `syscall_id`
+    fn get_current_syscall_count(&self, syscall_id: usize) -> isize {
+        let inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        inner.tasks[cur].get_syscall_count(syscall_id)
+    }
+
+    /// Add an mmap area to the current 'Running' task's address space
+    fn mmap_current(&self, start: usize, len: usize, permission: MapPermission) -> bool {
+        let mut inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        inner.tasks[cur].mmap(start, len, permission)
+    }
+
+    /// Remove an mmap area from the current 'Running' task's address space
+    fn munmap_current(&self, start: usize, len: usize) -> bool {
+        let mut inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        inner.tasks[cur].munmap(start, len)
+    }
+
     /// Switch current `Running` task to the task we have found,
     /// or there is no `Ready` task and we can exit with all applications completed
     fn run_next_task(&self) {
@@ -201,4 +232,26 @@ pub fn current_trap_cx() -> &'static mut TrapContext {
 /// Change the current 'Running' task's program break
 pub fn change_program_brk(size: i32) -> Option<usize> {
     TASK_MANAGER.change_current_program_brk(size)
+}
+
+/// Record one more call of the syscall numbered `syscall_id` by the current
+/// 'Running' task
+pub fn incr_syscall_count(syscall_id: usize) {
+    TASK_MANAGER.incr_current_syscall_count(syscall_id);
+}
+
+/// How many times the current 'Running' task has called the syscall numbered
+/// `syscall_id`
+pub fn get_syscall_count(syscall_id: usize) -> isize {
+    TASK_MANAGER.get_current_syscall_count(syscall_id)
+}
+
+/// Add an mmap area to the current 'Running' task's address space
+pub fn mmap_current(start: usize, len: usize, permission: MapPermission) -> bool {
+    TASK_MANAGER.mmap_current(start, len, permission)
+}
+
+/// Remove an mmap area from the current 'Running' task's address space
+pub fn munmap_current(start: usize, len: usize) -> bool {
+    TASK_MANAGER.munmap_current(start, len)
 }

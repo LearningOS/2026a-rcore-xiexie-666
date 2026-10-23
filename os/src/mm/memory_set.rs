@@ -262,6 +262,62 @@ impl MemorySet {
             false
         }
     }
+
+    /// Map a fresh frame-backed area `[start, end)` for `sys_mmap`.
+    ///
+    /// Unlike [`MemorySet::insert_framed_area`], the range is checked against
+    /// the areas that are already mapped, so that a user application cannot
+    /// silently overwrite its own code or stack. Return `false` on a conflict.
+    pub fn insert_mmap_area(
+        &mut self,
+        start: VirtAddr,
+        end: VirtAddr,
+        permission: MapPermission,
+    ) -> bool {
+        let start_vpn = start.floor();
+        let end_vpn = end.ceil();
+        if start_vpn >= end_vpn {
+            return false;
+        }
+        for area in self.areas.iter() {
+            let area_start = area.vpn_range.get_start();
+            let area_end = area.vpn_range.get_end();
+            // an empty area (such as the one reserved for sbrk) maps nothing
+            if area_start == area_end {
+                continue;
+            }
+            if start_vpn < area_end && area_start < end_vpn {
+                return false;
+            }
+        }
+        self.push(
+            MapArea::new(start, end, MapType::Framed, permission),
+            None,
+        );
+        true
+    }
+
+    /// Unmap the area that covers exactly `[start, end)` for `sys_munmap`.
+    ///
+    /// Return `false` when no single area matches the range exactly, i.e. the
+    /// caller asked for a partial or an unmapped region. On success the pages
+    /// are unmapped from the page table and their frames are released.
+    pub fn remove_mmap_area(&mut self, start: VirtAddr, end: VirtAddr) -> bool {
+        let start_vpn = start.floor();
+        let end_vpn = end.ceil();
+        let position = self.areas.iter().position(|area| {
+            area.vpn_range.get_start() == start_vpn && area.vpn_range.get_end() == end_vpn
+        });
+        match position {
+            Some(index) => {
+                let mut area = self.areas.remove(index);
+                area.unmap(&mut self.page_table);
+                // `area` is dropped here, which frees its physical frames
+                true
+            }
+            None => false,
+        }
+    }
 }
 /// map area structure, controls a contiguous piece of virtual memory
 pub struct MapArea {

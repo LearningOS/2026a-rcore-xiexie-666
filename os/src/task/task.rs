@@ -1,6 +1,6 @@
 //! Types related to task management
 use super::TaskContext;
-use crate::config::TRAP_CONTEXT_BASE;
+use crate::config::{MAX_SYSCALL_NUM, TRAP_CONTEXT_BASE};
 use crate::mm::{
     kernel_stack_position, MapPermission, MemorySet, PhysPageNum, VirtAddr, KERNEL_SPACE,
 };
@@ -28,6 +28,9 @@ pub struct TaskControlBlock {
 
     /// Program break
     pub program_brk: usize,
+
+    /// How many times this task has called each syscall, indexed by syscall id
+    pub syscall_count: [usize; MAX_SYSCALL_NUM],
 }
 
 impl TaskControlBlock {
@@ -63,6 +66,7 @@ impl TaskControlBlock {
             base_size: user_sp,
             heap_bottom: user_sp,
             program_brk: user_sp,
+            syscall_count: [0; MAX_SYSCALL_NUM],
         };
         // prepare TrapContext in user space
         let trap_cx = task_control_block.get_trap_cx();
@@ -95,6 +99,51 @@ impl TaskControlBlock {
         } else {
             None
         }
+    }
+
+    /// Record one more call of the syscall numbered `syscall_id`.
+    ///
+    /// Ids beyond the table are ignored: the kernel cannot know in advance how
+    /// large a syscall number a malicious application may pass.
+    pub fn incr_syscall_count(&mut self, syscall_id: usize) {
+        if syscall_id < MAX_SYSCALL_NUM {
+            self.syscall_count[syscall_id] = self.syscall_count[syscall_id].saturating_add(1);
+        }
+    }
+
+    /// How many times this task has called the syscall numbered `syscall_id`.
+    ///
+    /// Return `-1` for an out-of-range syscall id.
+    pub fn get_syscall_count(&self, syscall_id: usize) -> isize {
+        if syscall_id < MAX_SYSCALL_NUM {
+            self.syscall_count[syscall_id] as isize
+        } else {
+            -1
+        }
+    }
+
+    /// Map `[start, start + len)` of the user address space on demand.
+    ///
+    /// Return `false` when the range overlaps with memory that is already
+    /// mapped, which is how `sys_mmap` reports an error.
+    pub fn mmap(&mut self, start: usize, len: usize, permission: MapPermission) -> bool {
+        let start_va = VirtAddr::from(start);
+        let end_va = VirtAddr::from(start + len);
+        self.memory_set
+            .insert_mmap_area(start_va, end_va, permission)
+    }
+
+    /// Tear down the mmap area that covers exactly `[start, start + len)`.
+    ///
+    /// Return `false` when there is no such area. The page table entries are
+    /// cleared and the physical frames are returned to the frame allocator.
+    pub fn munmap(&mut self, start: usize, len: usize) -> bool {
+        let start_va = VirtAddr::from(start);
+        let end_va = VirtAddr::from(start + len);
+        // the page table entries are cleared here; the new state becomes
+        // visible when `__switch`/`trap_return` reloads `satp` and flushes
+        // the TLB, so there is nothing to activate from inside a syscall
+        self.memory_set.remove_mmap_area(start_va, end_va)
     }
 }
 
