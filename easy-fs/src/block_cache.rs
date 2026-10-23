@@ -74,8 +74,8 @@ impl Drop for BlockCache {
         self.sync()
     }
 }
-/// Use a block cache of 16 blocks
-const BLOCK_CACHE_SIZE: usize = 16;
+/// Use a block cache of 128 blocks
+const BLOCK_CACHE_SIZE: usize = 128;
 
 pub struct BlockCacheManager {
     queue: VecDeque<(usize, Arc<Mutex<BlockCache>>)>,
