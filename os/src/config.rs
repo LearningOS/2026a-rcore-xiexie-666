@@ -17,5 +17,7 @@ pub const APP_SIZE_LIMIT: usize = 0x20000;
 
 /// clock frequency
 pub const CLOCK_FREQ: usize = 12500000;
+/// the max number of syscall kinds whose call count can be traced by `sys_trace`
+pub const MAX_SYSCALL_NUM: usize = 512;
 /// the physical memory end
 pub const MEMORY_END: usize = 0x88000000;
