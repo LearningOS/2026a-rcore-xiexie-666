@@ -3,6 +3,7 @@
 use super::id::RecycleAllocator;
 use super::manager::insert_into_pid2process;
 use super::TaskControlBlock;
+use super::TaskStatus;
 use super::{add_task, SignalFlags};
 use super::{pid_alloc, PidHandle};
 use crate::fs::{File, Stdin, Stdout};
@@ -49,6 +50,171 @@ pub struct ProcessControlBlockInner {
     pub semaphore_list: Vec<Option<Arc<Semaphore>>>,
     /// condvar list
     pub condvar_list: Vec<Option<Arc<Condvar>>>,
+    /// deadlock detection state (banker's algorithm)
+    pub deadlock_detector: DeadlockDetector,
+}
+
+/// Number of independent resource spaces kept by [`DeadlockDetector`].
+///
+/// The lab explicitly allows mutexes and semaphores to be checked separately,
+/// so each kind of synchronisation primitive owns its own resource space and its
+/// own pair of matrices.
+const DEADLOCK_SPACE_NUM: usize = 2;
+
+/// Banker's-algorithm deadlock detector belonging to one process.
+///
+/// For every resource space it stores, per thread, how many units of every
+/// resource that thread *holds* (the `Allocation` matrix) and how many units it
+/// is still *waiting for* (the `Need` matrix). `Available` is not stored: it is
+/// derived from the live state of the mutex / semaphore objects at check time,
+/// which is always exact.
+pub struct DeadlockDetector {
+    enabled: bool,
+    allocation: [Vec<Vec<usize>>; DEADLOCK_SPACE_NUM],
+    pending: [Vec<Vec<usize>>; DEADLOCK_SPACE_NUM],
+}
+
+impl DeadlockDetector {
+    /// Create a detector with detection disabled
+    pub fn new() -> Self {
+        Self {
+            enabled: false,
+            allocation: [Vec::new(), Vec::new()],
+            pending: [Vec::new(), Vec::new()],
+        }
+    }
+
+    /// Whether deadlock detection is currently enabled
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Enable or disable deadlock detection
+    pub fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+    }
+
+    /// Grow a matrix so that it can describe `threads` threads owning
+    /// `resources` resources. Rows already present keep their content: tids and
+    /// resource ids are only ever appended, never reused with a new meaning.
+    fn grow(table: &mut Vec<Vec<usize>>, threads: usize, resources: usize) {
+        if table.len() < threads {
+            table.resize(threads, Vec::new());
+        }
+        for row in table.iter_mut() {
+            if row.len() < resources {
+                row.resize(resources, 0);
+            }
+        }
+    }
+
+    /// Record that one unit of `resource` has just been granted to `thread`
+    pub fn on_acquire(
+        &mut self,
+        space: usize,
+        thread: usize,
+        resource: usize,
+        threads: usize,
+        resources: usize,
+    ) {
+        Self::grow(&mut self.allocation[space], threads, resources);
+        Self::grow(&mut self.pending[space], threads, resources);
+        self.allocation[space][thread][resource] += 1;
+        self.pending[space][thread][resource] = 0;
+    }
+
+    /// Record that one unit of `resource` has just been released by `thread`
+    pub fn on_release(&mut self, space: usize, thread: usize, resource: usize) {
+        if let Some(row) = self.allocation[space].get_mut(thread) {
+            if let Some(units) = row.get_mut(resource) {
+                *units = units.saturating_sub(1);
+            }
+        }
+        if let Some(row) = self.pending[space].get_mut(thread) {
+            if let Some(units) = row.get_mut(resource) {
+                *units = 0;
+            }
+        }
+    }
+
+    /// Remember that `thread` is now waiting for one unit of `resource`
+    pub fn set_pending(
+        &mut self,
+        space: usize,
+        thread: usize,
+        resource: usize,
+        threads: usize,
+        resources: usize,
+    ) {
+        Self::grow(&mut self.pending[space], threads, resources);
+        self.pending[space][thread][resource] = 1;
+    }
+
+    /// Run the banker's safety check of `space` assuming that `requester` is
+    /// asking for one unit of `resource`.
+    ///
+    /// `available` is the `Available` vector, `blocked[i]` tells whether thread
+    /// `i` is really blocked. Only the claims of *blocked* threads are counted
+    /// on top of the claim of `requester`: a thread that has already been woken
+    /// up is about to satisfy its own claim, so keeping its claim would turn a
+    /// healthy system into a false deadlock.
+    pub fn is_safe(
+        &mut self,
+        space: usize,
+        threads: usize,
+        resources: usize,
+        available: &[usize],
+        blocked: &[bool],
+        requester: usize,
+        resource: usize,
+    ) -> bool {
+        Self::grow(&mut self.allocation[space], threads, resources);
+        Self::grow(&mut self.pending[space], threads, resources);
+        let mut work = available.to_vec();
+        work.resize(resources, 0);
+        let mut finished = vec![false; threads];
+        let mut progressed = true;
+        while progressed {
+            progressed = false;
+            for thread in 0..threads {
+                if finished[thread] {
+                    continue;
+                }
+                let mut can_finish = true;
+                for r in 0..resources {
+                    let wanted = if thread == requester {
+                        if r == resource {
+                            1
+                        } else {
+                            self.pending[space][thread][r]
+                        }
+                    } else if blocked.get(thread).copied().unwrap_or(false) {
+                        self.pending[space][thread][r]
+                    } else {
+                        0
+                    };
+                    if wanted > work[r] {
+                        can_finish = false;
+                        break;
+                    }
+                }
+                if can_finish {
+                    for r in 0..resources {
+                        work[r] += self.allocation[space][thread][r];
+                    }
+                    finished[thread] = true;
+                    progressed = true;
+                }
+            }
+        }
+        finished.iter().all(|f| *f)
+    }
+}
+
+impl Default for DeadlockDetector {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ProcessControlBlockInner {
@@ -81,6 +247,21 @@ impl ProcessControlBlockInner {
     /// get a task with tid in this process
     pub fn get_task(&self, tid: usize) -> Arc<TaskControlBlock> {
         self.tasks[tid].as_ref().unwrap().clone()
+    }
+    /// For every tid of this process, tell whether that thread is blocked.
+    ///
+    /// The deadlock detector uses it to decide whose pending claims still have
+    /// to be taken into account.
+    pub fn blocked_flags(&self) -> Vec<bool> {
+        self.tasks
+            .iter()
+            .map(|task| match task {
+                Some(task) => {
+                    task.inner_exclusive_access().task_status == TaskStatus::Blocked
+                }
+                None => false,
+            })
+            .collect()
     }
 }
 
@@ -119,6 +300,7 @@ impl ProcessControlBlock {
                     mutex_list: Vec::new(),
                     semaphore_list: Vec::new(),
                     condvar_list: Vec::new(),
+                    deadlock_detector: DeadlockDetector::new(),
                 })
             },
         });
@@ -245,6 +427,7 @@ impl ProcessControlBlock {
                     mutex_list: Vec::new(),
                     semaphore_list: Vec::new(),
                     condvar_list: Vec::new(),
+                    deadlock_detector: DeadlockDetector::new(),
                 })
             },
         });

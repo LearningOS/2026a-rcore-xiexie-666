@@ -52,4 +52,18 @@ impl Semaphore {
             block_current_and_run_next();
         }
     }
+
+    /// How many permits of this semaphore are currently free.
+    ///
+    /// `count` is allowed to go negative: it then holds minus the number of
+    /// threads that are waiting in `wait_queue`. The deadlock detector needs
+    /// this as the `Available` entry of the banker's algorithm.
+    pub fn available(&self) -> usize {
+        let inner = self.inner.exclusive_access();
+        if inner.count > 0 {
+            inner.count as usize
+        } else {
+            0
+        }
+    }
 }

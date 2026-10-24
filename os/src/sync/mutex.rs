@@ -12,6 +12,11 @@ pub trait Mutex: Sync + Send {
     fn lock(&self);
     /// Unlock the mutex
     fn unlock(&self);
+    /// How many units of this mutex are currently free (0 or 1).
+    ///
+    /// The deadlock detector needs it to build the `Available` vector of the
+    /// banker's algorithm.
+    fn available(&self) -> usize;
 }
 
 /// Spinlock Mutex struct
@@ -49,6 +54,14 @@ impl Mutex for MutexSpin {
         trace!("kernel: MutexSpin::unlock");
         let mut locked = self.locked.exclusive_access();
         *locked = false;
+    }
+
+    fn available(&self) -> usize {
+        if *self.locked.exclusive_access() {
+            0
+        } else {
+            1
+        }
     }
 }
 
@@ -100,6 +113,14 @@ impl Mutex for MutexBlocking {
             wakeup_task(waking_task);
         } else {
             mutex_inner.locked = false;
+        }
+    }
+
+    fn available(&self) -> usize {
+        if self.inner.exclusive_access().locked {
+            0
+        } else {
+            1
         }
     }
 }

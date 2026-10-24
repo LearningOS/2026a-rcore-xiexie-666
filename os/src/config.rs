@@ -10,6 +10,10 @@ pub const KERNEL_STACK_SIZE: usize = 4096 * 2;
 pub const KERNEL_HEAP_SIZE: usize = 0x200_0000;
 /// physical memory end address
 pub const MEMORY_END: usize = 0x88000000;
+/// resource space index of mutexes inside the deadlock detector
+pub const DEADLOCK_SPACE_MUTEX: usize = 0;
+/// resource space index of semaphores inside the deadlock detector
+pub const DEADLOCK_SPACE_SEMAPHORE: usize = 1;
 /// page size : 4KB
 pub const PAGE_SIZE: usize = 0x1000;
 /// page size bits: 12
